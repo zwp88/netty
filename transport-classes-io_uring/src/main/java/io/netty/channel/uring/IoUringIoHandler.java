@@ -15,9 +15,9 @@
  */
 package io.netty.channel.uring;
 
-import io.netty.channel.IoHandlerContext;
 import io.netty.channel.IoHandle;
 import io.netty.channel.IoHandler;
+import io.netty.channel.IoHandlerContext;
 import io.netty.channel.IoHandlerFactory;
 import io.netty.channel.IoOps;
 import io.netty.channel.IoRegistration;
@@ -164,6 +164,9 @@ public final class IoUringIoHandler implements IoHandler {
     @Override
     public int run(IoHandlerContext context) {
         if (closeCompleted) {
+            if (context.shouldReportActiveIoTime()) {
+                context.reportActiveIoTime(0);
+            }
             return 0;
         }
         SubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();
@@ -178,19 +181,35 @@ public final class IoUringIoHandler implements IoHandler {
             // Even if we have some completions already pending we can still try to even fetch more.
             submitAndClearNow(submissionQueue);
         }
-        return processCompletionsAndHandleOverflow(submissionQueue, completionQueue, this::handle);
+
+        int processed;
+        if (context.shouldReportActiveIoTime()) {
+            // Timer starts after the blocking wait, around the processing of completions.
+            long activeIoStartTimeNanos = System.nanoTime();
+            processed = processCompletionsAndHandleOverflow(submissionQueue, completionQueue, this::handle);
+            long activeIoEndTimeNanos = System.nanoTime();
+            context.reportActiveIoTime(activeIoEndTimeNanos - activeIoStartTimeNanos);
+        } else {
+            processed = processCompletionsAndHandleOverflow(submissionQueue, completionQueue, this::handle);
+        }
+        return processed;
     }
 
     private int processCompletionsAndHandleOverflow(SubmissionQueue submissionQueue, CompletionQueue completionQueue,
                                          CompletionCallback callback) {
         int processed = 0;
-        for (;;) {
+        // Bound the maximum number of times this will loop before we return and so execute some non IO stuff.
+        // 128 here is just some sort of bound and another number might be ok as well.
+        for (int i = 0; i < 128; i++) {
             int p = completionQueue.process(callback);
             if ((submissionQueue.flags() & Native.IORING_SQ_CQ_OVERFLOW) != 0) {
                 logger.warn("CompletionQueue overflow detected, consider increasing size: {} ",
                         completionQueue.ringEntries);
                 submitAndClearNow(submissionQueue);
-            } else if (p == 0) {
+            } else if (p == 0 &&
+                    // Let's try to submit again and check if there are new completions to handle.
+                    // Only break the loop if there was nothing submitted and there are no new completions.
+                    submitAndClearNow(submissionQueue) == 0 && !completionQueue.hasCompletions()) {
                 break;
             }
 

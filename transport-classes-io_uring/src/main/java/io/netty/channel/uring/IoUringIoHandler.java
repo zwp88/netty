@@ -99,11 +99,9 @@ public final class IoUringIoHandler implements IoHandler {
         // It only makes sense when the user actually specifies the cq ring size.
         int cqSize = 2 * config.getRingSize();
         if (config.needSetupCqeSize()) {
-            if (!IoUring.isSetupCqeSizeSupported()) {
-                throw new UnsupportedOperationException("IORING_SETUP_CQSIZE is not supported");
-            }
+            assert IoUring.isSetupCqeSizeSupported();
             setupFlags |= Native.IORING_SETUP_CQSIZE;
-            cqSize = config.checkCqSize(config.getCqSize());
+            cqSize = config.getCqSize();
         }
         this.ringBuffer = Native.createRingBuffer(config.getRingSize(), cqSize, setupFlags);
         if (IoUring.isRegisterIowqMaxWorkersSupported() && config.needRegisterIowqMaxWorker()) {
@@ -120,11 +118,6 @@ public final class IoUringIoHandler implements IoHandler {
         registeredIoUringBufferRing = new IntObjectHashMap<>();
         Collection<IoUringBufferRingConfig> bufferRingConfigs = config.getInternBufferRingConfigs();
         if (bufferRingConfigs != null && !bufferRingConfigs.isEmpty()) {
-            if (!IoUring.isRegisterBufferRingSupported()) {
-                // Close ringBuffer before throwing to ensure we release all memory on failure.
-                ringBuffer.close();
-                throw new UnsupportedOperationException("IORING_REGISTER_PBUF_RING is not supported");
-            }
             for (IoUringBufferRingConfig bufferRingConfig : bufferRingConfigs) {
                 try {
                     IoUringBufferRing ring = newBufferRing(ringBuffer.fd(), bufferRingConfig);
@@ -268,7 +261,7 @@ public final class IoUringIoHandler implements IoHandler {
         }
     }
 
-    private boolean handle(int res, int flags, long udata, ByteBuffer extraCqeData) {
+    private void handle(int res, int flags, long udata, ByteBuffer extraCqeData) {
         try {
             int id = UserData.decodeId(udata);
             byte op = UserData.decodeOp(udata);
@@ -280,25 +273,23 @@ public final class IoUringIoHandler implements IoHandler {
             }
             if (id == EVENTFD_ID) {
                 handleEventFdRead();
-                return true;
+                return;
             }
             if (id == RINGFD_ID) {
                 // Just return
-                return true;
+                return;
             }
             DefaultIoUringIoRegistration registration = registrations.get(id);
             if (registration == null) {
                 logger.debug("ignoring {} completion for unknown registration (id={}, res={})",
                         Native.opToStr(op), id, res);
-                return true;
+                return;
             }
             registration.handle(res, flags, op, data, extraCqeData);
-            return true;
         } catch (Error e) {
             throw e;
         } catch (Throwable throwable) {
             handleLoopException(throwable);
-            return true;
         }
     }
 
@@ -429,11 +420,11 @@ public final class IoUringIoHandler implements IoHandler {
                 boolean eventFdDrained;
 
                 @Override
-                public boolean handle(int res, int flags, long udata, ByteBuffer extraCqeData) {
+                public void handle(int res, int flags, long udata, ByteBuffer extraCqeData) {
                     if (UserData.decodeId(udata) == EVENTFD_ID) {
                         eventFdDrained = true;
                     }
-                    return IoUringIoHandler.this.handle(res, flags, udata, extraCqeData);
+                    IoUringIoHandler.this.handle(res, flags, udata, extraCqeData);
                 }
             }
             final DrainFdEventCallback handler = new DrainFdEventCallback();
@@ -487,6 +478,7 @@ public final class IoUringIoHandler implements IoHandler {
                 registrations.put(id, old);
             } else {
                 registration.setId(id);
+                ioHandle.registered();
                 break;
             }
         }
@@ -587,6 +579,7 @@ public final class IoUringIoHandler implements IoHandler {
         private void remove() {
             DefaultIoUringIoRegistration old = registrations.remove(id);
             assert old == this;
+            handle.unregistered();
         }
 
         void close() {
@@ -695,16 +688,16 @@ public final class IoUringIoHandler implements IoHandler {
      */
     public static IoHandlerFactory newFactory(IoUringIoHandlerConfig config) {
         IoUring.ensureAvailability();
-        ObjectUtil.checkNotNull(config, "config");
+        final IoUringIoHandlerConfig copy = ObjectUtil.checkNotNull(config, "config").verifyAndClone();
         return new IoHandlerFactory() {
             @Override
             public IoHandler newHandler(ThreadAwareExecutor eventLoop) {
-                return new IoUringIoHandler(eventLoop, config);
+                return new IoUringIoHandler(eventLoop, copy);
             }
 
             @Override
             public boolean isChangingThreadSupported() {
-                return !config.singleIssuer();
+                return !copy.singleIssuer();
             }
         };
     }
